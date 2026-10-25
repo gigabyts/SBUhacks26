@@ -1,38 +1,86 @@
+
 #include "thingProperties.h"
 #include <Servo.h>
+#include <math.h>
+
+// =====================================
+// CONFIGURATION
+// =====================================
+
+const int SERVO_PIN = 9;
+
+// Commanded servo travel: 0 to 180 degrees
+const int REST_ANGLE = 0;
+const int ACTIVE_ANGLE = 180;
+
+// Allow time for the servo to move
+const unsigned long SERVO_INTERVAL = 750;
+
+// Two velocity-proxy thresholds
+const float LOW_VELOCITY_THRESHOLD = 0.75f;
+const float HIGH_VELOCITY_THRESHOLD = 2.25f;
+
+// Acceleration-based fallback thresholds
+const bool ENABLE_SHAKE_FALLBACK = true;
+
+const float LOW_SHAKE_THRESHOLD_G = 1.5f;
+const float HIGH_SHAKE_THRESHOLD_G = 3.0f;
+
+// Acceleration settings
+const float GRAVITY = 9.80665f;
+const float RESTING_G = 1.0f;
+const float NOISE_TOLERANCE = 0.05f;
+
+// Integration settings
+const unsigned long MAX_SAMPLE_GAP = 2000;
+const float MAX_INTEGRATION_DT = 0.15f;
+
+// Automatic rearming
+const unsigned long REARM_STILL_TIME = 2000;
+const float STILL_TOLERANCE_G = 0.08f;
+
+// =====================================
+// GLOBAL VARIABLES
+// =====================================
 
 Servo sg90;
 
-const int SERVO_PIN = 8;
+// Numerical integration
+float velocityProxy = 0.0f;
+float previousAcceleration = 0.0f;
 
-const int REST_ANGLE = 20;
-const int EXTEND_ANGLE = 90;
+unsigned long previousSampleTime = 0;
+bool havePreviousSample = false;
 
-const unsigned long SERVO_STEP_MS = 600;
+// Trigger logic
+bool armed = true;
+bool triggered = false;
 
-// Trigger at or above 1.0 m/s
-const float VELOCITY_THRESHOLD = 1.0f;
-
-// Must drop below this before re-arming
-const float REARM_THRESHOLD = 0.8f;
-
-
+// Servo sequence
 bool servoRunning = false;
-bool armed = false;
+bool movingOut = false;
 
-int servoStep = 0;
-unsigned long lastServoStep = 0;
+int targetCycles = 0;
+int completedCycles = 0;
+
+unsigned long previousServoTime = 0;
+
+// Automatic reset
+bool countingStillness = false;
+unsigned long stillStartTime = 0;
+
+// =====================================
+// SETUP
+// =====================================
 
 void setup() {
 
-  Serial.begin(9600);
+  Serial.begin(115200);
   delay(1500);
 
-  // Servo initialization
   sg90.attach(SERVO_PIN);
   sg90.write(REST_ANGLE);
 
-  // Arduino Cloud initialization
   initProperties();
 
   ArduinoCloud.begin(
@@ -42,69 +90,262 @@ void setup() {
   setDebugMessageLevel(2);
   ArduinoCloud.printDebugInfo();
 
-  Serial.println("System initialized");
+  Serial.println("==========================");
+  Serial.println("MOTIONGUARD READY");
+  Serial.println("==========================");
+
+  Serial.println("LOW: 1 cycle");
+  Serial.println("HIGH: 2 cycles");
+  Serial.println("Automatic rearming enabled.");
 }
 
-
+// =====================================
+// MAIN LOOP
+// =====================================
 
 void loop() {
 
   ArduinoCloud.update();
 
-  // testSpeedMps is entered on the dashboard.
-  // It is NOT calculated from acceleration.
-  float speed = testSpeedMps;
-
-  // Only re-arm below 0.8 m/s
-  if (!servoRunning &&
-      speed < REARM_THRESHOLD) {
-    armed = true;
-  }
-
-  // Trigger on threshold crossing
-  if (armed &&
-      !servoRunning &&
-      speed >= VELOCITY_THRESHOLD) {
-
-    armed = false;
-    startServoSequence();
-  }
-
-  // Continue servo sequence without delay()
+  // Nonblocking servo control
   updateServo();
 
-  // Print measurements every 500 ms
   static unsigned long lastPrint = 0;
 
   if (millis() - lastPrint >= 500) {
+
     lastPrint = millis();
 
-    Serial.print("iPhone accel: ");
-    Serial.print(linear_accel, 3);
+    Serial.print("Acceleration: ");
+    Serial.print(linAccel, 3);
+    Serial.print(" g");
 
-    Serial.print(" | Test speed: ");
-    Serial.print(speed, 3);
+    Serial.print(" | Velocity proxy: ");
+    Serial.print(velocityProxy, 3);
 
-    Serial.println(" m/s");
+    Serial.print(" | Armed: ");
+    Serial.print(armed);
+
+    Serial.print(" | Cycles: ");
+    Serial.print(completedCycles);
+    Serial.print("/");
+    Serial.println(targetCycles);
   }
 }
 
+// =====================================
+// ACCELERATION CONVERSION
+// =====================================
 
+float convertAcceleration(float gReading) {
 
-void startServoSequence() {
+  float excessG = gReading - RESTING_G;
 
-  servoRunning = true;
-  servoStep = 1;
+  if (excessG < NOISE_TOLERANCE) {
+    return 0.0f;
+  }
 
-  lastServoStep = millis();
-
-  // Begin first outward movement
-  sg90.write(EXTEND_ANGLE);
-
-  Serial.println("VELOCITY THRESHOLD REACHED");
-  Serial.println("Starting servo sequence");
+  return excessG * GRAVITY;
 }
 
+// =====================================
+// NUMERICAL INTEGRATION
+// =====================================
+
+void integrateAcceleration(
+    float acceleration,
+    unsigned long now) {
+
+  if (!havePreviousSample) {
+
+    previousAcceleration = acceleration;
+    previousSampleTime = now;
+    havePreviousSample = true;
+
+    return;
+  }
+
+  unsigned long elapsed =
+      now - previousSampleTime;
+
+  previousSampleTime = now;
+
+  if (elapsed == 0) {
+    return;
+  }
+
+  if (elapsed > MAX_SAMPLE_GAP) {
+
+    velocityProxy = 0.0f;
+    previousAcceleration = acceleration;
+
+    Serial.println("Integration reset: long gap");
+    return;
+  }
+
+  float dt = elapsed / 1000.0f;
+
+  // Avoid assigning a long Cloud interval
+  // to a brief acceleration spike
+  if (dt > MAX_INTEGRATION_DT) {
+    dt = MAX_INTEGRATION_DT;
+  }
+
+  // Trapezoidal numerical integration
+  float deltaV =
+      0.5f *
+      (previousAcceleration + acceleration) *
+      dt;
+
+  velocityProxy += deltaV;
+
+  previousAcceleration = acceleration;
+
+  Serial.print("Integrated proxy: ");
+  Serial.println(velocityProxy, 4);
+}
+
+// =====================================
+// CLOUD ACCELERATION CALLBACK
+// =====================================
+
+void onLinAccelChange() {
+
+  unsigned long now = millis();
+  float gReading = linAccel;
+
+  if (!isfinite(gReading) ||
+      gReading < 0.0f ||
+      gReading > 20.0f) {
+    return;
+  }
+
+  Serial.print("Received acceleration: ");
+  Serial.print(gReading, 4);
+  Serial.println(" g");
+
+  // If a sequence has finished,
+  // check whether the phone is at rest
+  // and we can re-arm the system.
+  if (triggered && !servoRunning) {
+
+    checkAutomaticRearm(gReading, now);
+    return;
+  }
+
+  if (!armed && !servoRunning) {
+    return;
+  }
+
+  // ---------------------------------
+  // Update numerical integration
+  // ---------------------------------
+
+  float acceleration =
+      convertAcceleration(gReading);
+
+  integrateAcceleration(acceleration, now);
+
+  // ---------------------------------
+  // Check HIGH threshold first
+  // ---------------------------------
+
+  bool highDetected =
+      velocityProxy >= HIGH_VELOCITY_THRESHOLD;
+
+  if (ENABLE_SHAKE_FALLBACK &&
+      gReading >= HIGH_SHAKE_THRESHOLD_G) {
+    highDetected = true;
+  }
+
+  // ---------------------------------
+  // Check LOW threshold
+  // ---------------------------------
+
+  bool lowDetected =
+      velocityProxy >= LOW_VELOCITY_THRESHOLD;
+
+  if (ENABLE_SHAKE_FALLBACK &&
+      gReading >= LOW_SHAKE_THRESHOLD_G) {
+    lowDetected = true;
+  }
+
+  // ---------------------------------
+  // Upgrade an active LOW sequence
+  // if a HIGH reading arrives.
+  // ---------------------------------
+
+  if (servoRunning) {
+
+    if (highDetected && targetCycles == 1) {
+
+      targetCycles = 2;
+
+      Serial.println("========================");
+      Serial.println("UPGRADED TO HIGH!");
+      Serial.println("Now performing 2 cycles.");
+      Serial.println("========================");
+    }
+
+    return;
+  }
+
+  // ---------------------------------
+  // Start a new sequence
+  // ---------------------------------
+
+  if (highDetected) {
+
+    Serial.println("========================");
+    Serial.println("HIGH THRESHOLD EXCEEDED!");
+    Serial.println("========================");
+
+    startServoSequence(2);
+
+  } else if (lowDetected) {
+
+    Serial.println("========================");
+    Serial.println("LOW THRESHOLD EXCEEDED!");
+    Serial.println("========================");
+
+    startServoSequence(1);
+  }
+}
+
+// =====================================
+// START SERVO SEQUENCE
+// =====================================
+
+void startServoSequence(int cycles) {
+
+  if (triggered || servoRunning) {
+    return;
+  }
+
+  triggered = true;
+  armed = false;
+
+  servoRunning = true;
+  movingOut = true;
+
+  targetCycles = cycles;
+  completedCycles = 0;
+
+  previousServoTime = millis();
+
+  countingStillness = false;
+  stillStartTime = 0;
+
+  // Start first forward rotation
+  sg90.write(ACTIVE_ANGLE);
+
+  Serial.print("Servo activated! Target cycles: ");
+  Serial.println(targetCycles);
+}
+
+// =====================================
+// SERVO MOVEMENT
+// =====================================
 
 void updateServo() {
 
@@ -112,52 +353,106 @@ void updateServo() {
     return;
   }
 
-  if (millis() - lastServoStep < SERVO_STEP_MS) {
+  unsigned long now = millis();
+
+  if (now - previousServoTime < SERVO_INTERVAL) {
     return;
   }
 
-  lastServoStep = millis();
+  previousServoTime = now;
 
-  switch (servoStep) {
+  if (movingOut) {
 
-    case 1:
-      // First return
-      sg90.write(REST_ANGLE);
-      servoStep = 2;
-      break;
+    // Return from 180 degrees to 0 degrees
+    sg90.write(REST_ANGLE);
 
-    case 2:
-      // Second outward movement
-      sg90.write(EXTEND_ANGLE);
-      servoStep = 3;
-      break;
+    movingOut = false;
+    completedCycles++;
 
-    case 3:
-      // Second return
-      sg90.write(REST_ANGLE);
-      servoStep = 4;
-      break;
+    Serial.print("Completed return: ");
+    Serial.println(completedCycles);
 
-    case 4:
+  } else {
+
+    // Start another cycle if required
+    if (completedCycles < targetCycles) {
+
+      sg90.write(ACTIVE_ANGLE);
+
+      movingOut = true;
+
+      Serial.println("Starting next cycle.");
+
+    } else {
+
+      // All requested cycles completed
       servoRunning = false;
-      servoStep = 0;
 
-      Serial.println("Servo sequence complete");
-      break;
+      Serial.println("========================");
+      Serial.println("SERVO SEQUENCE COMPLETE");
+      Serial.println("========================");
+
+      Serial.println("Waiting for stillness...");
+    }
   }
 }
 
+// =====================================
+// AUTOMATIC REARMING
+// =====================================
 
-// Invoked when testSpeedMps changes through Cloud
-void onTestSpeedMpsChange() {
-  Serial.print("New test speed: ");
-  Serial.println(testSpeedMps);
+void checkAutomaticRearm(
+    float gReading,
+    unsigned long now) {
+
+  bool isStill =
+      fabsf(gReading - RESTING_G)
+      <= STILL_TOLERANCE_G;
+
+  if (isStill) {
+
+    if (!countingStillness) {
+
+      countingStillness = true;
+      stillStartTime = now;
+    }
+
+    if (now - stillStartTime >=
+        REARM_STILL_TIME) {
+
+      resetDetection();
+    }
+
+  } else {
+
+    countingStillness = false;
+    stillStartTime = 0;
+  }
 }
 
-// Used if the synchronized variable has
-// an on-change callback in thingProperties.h
-void onLinearAccelChange() {
-  Serial.print("New iPhone acceleration: ");
-  Serial.println(linear_accel, 4);
+// =====================================
+// RESET DETECTION
+// =====================================
+
+void resetDetection() {
+
+  velocityProxy = 0.0f;
+  previousAcceleration = 0.0f;
+
+  havePreviousSample = false;
+  previousSampleTime = 0;
+
+  armed = true;
+  triggered = false;
+
+  targetCycles = 0;
+  completedCycles = 0;
+
+  countingStillness = false;
+  stillStartTime = 0;
+
+  Serial.println("========================");
+  Serial.println("SYSTEM RE-ARMED");
+  Serial.println("Ready for next movement.");
+  Serial.println("========================");
 }
- 
