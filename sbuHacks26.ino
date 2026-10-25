@@ -1,56 +1,163 @@
+#include "thingProperties.h"
 #include <Servo.h>
-#include <Wire.h>
-#include <math.h>
-#include "MMA7660.h"
 
-MMA7660 accelemeter;
-Servo winchServo;
-int pos = 0;
+Servo sg90;
 
-findVelocity
+const int SERVO_PIN = 8;
+
+const int REST_ANGLE = 20;
+const int EXTEND_ANGLE = 90;
+
+const unsigned long SERVO_STEP_MS = 600;
+
+// Trigger at or above 1.0 m/s
+const float VELOCITY_THRESHOLD = 1.0f;
+
+// Must drop below this before re-arming
+const float REARM_THRESHOLD = 0.8f;
+
+
+bool servoRunning = false;
+bool armed = false;
+
+int servoStep = 0;
+unsigned long lastServoStep = 0;
+
 void setup() {
-  // put your setup code here, to run once:
-  winchServo.attach(8);
-  accelemeter.init();  
-	Serial.begin(9600);
 
+  Serial.begin(9600);
+  delay(1500);
 
+  // Servo initialization
+  sg90.attach(SERVO_PIN);
+  sg90.write(REST_ANGLE);
+
+  // Arduino Cloud initialization
+  initProperties();
+
+  ArduinoCloud.begin(
+    ArduinoIoTPreferredConnection
+  );
+
+  setDebugMessageLevel(2);
+  ArduinoCloud.printDebugInfo();
+
+  Serial.println("System initialized");
 }
+
+
 
 void loop() {
-  // put your main code here, to run repeatedly:
-  int8_t x;
-	int8_t y;
-	int8_t z;
-	float ax,ay,az;
-	accelemeter.getXYZ(&x,&y,&z);
-	
-	Serial.print("x = ");
-  Serial.println(x); 
-  Serial.print("y = ");
-  Serial.println(y);   
-  Serial.print("z = ");
-  Serial.println(z);
-	
-	accelemeter.getAcceleration(&ax,&ay,&az);
-  Serial.println("accleration of X/Y/Z: ");
-	Serial.print(ax);
-	Serial.println(" g");
-	Serial.print(ay);
-	Serial.println(" g");
-	Serial.print(az);
-	Serial.println(" g");
-	Serial.println("*************");
-	delay(500);
-  for (pos = 0; pos <= 180; pos += 1) { // goes from 0 degrees to 180 degrees
-    // in steps of 1 degree
-    winchServo.write(pos);              // tell servo to go to position in variable 'pos'
-    delay(15);                       // waits 15ms for the servo to reach the position
-  }
-  for (pos = 180; pos >= 0; pos -= 1) { // goes from 180 degrees to 0 degrees
-    winchServo.write(pos);              // tell servo to go to position in variable 'pos'
-    delay(15);                       // waits 15ms for the servo to reach the position
+
+  ArduinoCloud.update();
+
+  // testSpeedMps is entered on the dashboard.
+  // It is NOT calculated from acceleration.
+  float speed = testSpeedMps;
+
+  // Only re-arm below 0.8 m/s
+  if (!servoRunning &&
+      speed < REARM_THRESHOLD) {
+    armed = true;
   }
 
+  // Trigger on threshold crossing
+  if (armed &&
+      !servoRunning &&
+      speed >= VELOCITY_THRESHOLD) {
 
+    armed = false;
+    startServoSequence();
+  }
+
+  // Continue servo sequence without delay()
+  updateServo();
+
+  // Print measurements every 500 ms
+  static unsigned long lastPrint = 0;
+
+  if (millis() - lastPrint >= 500) {
+    lastPrint = millis();
+
+    Serial.print("iPhone accel: ");
+    Serial.print(linear_accel, 3);
+
+    Serial.print(" | Test speed: ");
+    Serial.print(speed, 3);
+
+    Serial.println(" m/s");
+  }
 }
+
+
+
+void startServoSequence() {
+
+  servoRunning = true;
+  servoStep = 1;
+
+  lastServoStep = millis();
+
+  // Begin first outward movement
+  sg90.write(EXTEND_ANGLE);
+
+  Serial.println("VELOCITY THRESHOLD REACHED");
+  Serial.println("Starting servo sequence");
+}
+
+
+void updateServo() {
+
+  if (!servoRunning) {
+    return;
+  }
+
+  if (millis() - lastServoStep < SERVO_STEP_MS) {
+    return;
+  }
+
+  lastServoStep = millis();
+
+  switch (servoStep) {
+
+    case 1:
+      // First return
+      sg90.write(REST_ANGLE);
+      servoStep = 2;
+      break;
+
+    case 2:
+      // Second outward movement
+      sg90.write(EXTEND_ANGLE);
+      servoStep = 3;
+      break;
+
+    case 3:
+      // Second return
+      sg90.write(REST_ANGLE);
+      servoStep = 4;
+      break;
+
+    case 4:
+      servoRunning = false;
+      servoStep = 0;
+
+      Serial.println("Servo sequence complete");
+      break;
+  }
+}
+
+
+// Invoked when testSpeedMps changes through Cloud
+void onTestSpeedMpsChange() {
+  Serial.print("New test speed: ");
+  Serial.println(testSpeedMps);
+}
+
+// Used if the synchronized variable has
+// an on-change callback in thingProperties.h
+void onLinearAccelChange() {
+  Serial.print("New iPhone acceleration: ");
+  Serial.println(linear_accel, 4);
+}
+ 
