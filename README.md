@@ -6,7 +6,7 @@ By combining smartphone sensors, wireless communication, numerical integration, 
 
 ## 💡 Inspiration
 
-What if your phone could detect how quickly you're moving and automatically interact with the physical world?
+What if you could know how fast you were biking or driving without looking at a screen?
 
 We wanted to explore a simple but interesting engineering challenge: **Can we use acceleration data from a smartphone to detect movement beyond a specified threshold and trigger a mechanical response?**
 
